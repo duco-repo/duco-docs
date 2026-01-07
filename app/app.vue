@@ -1,9 +1,9 @@
 <script setup lang="ts">
 const { seo } = useAppConfig()
 const route = useRoute()
-const version = computed(() => {
-  return (route.params.version as string) || 'v1'
-})
+// const version = computed(() => {
+//   return (route.params.version as string) || 'v1'
+// })
 
 const { data: navigation } = await useAsyncData('navigation', () => queryCollectionNavigation('docs'))
 // const { data: fullNavigation } = await useAsyncData(
@@ -25,7 +25,7 @@ const { data: files } = useLazyAsyncData('search', () => queryCollectionSearchSe
 //   'search',
 //   () => queryCollectionSearchSections('docs'),
 //   { server: false }
-// ) 
+// )
 
 // const files = computed(() => {
 //   if (!fullFiles.value) return []

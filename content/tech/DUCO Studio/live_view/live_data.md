@@ -10,7 +10,7 @@ navigation:
 
 After the machine is **key-on**, the **DUCO App** starts collecting data from the machine **once per second**.
 
-Currently, the message types collected for **Live Data** include:
+Currently, the **msgType** collected for **Live Data** include:
 
 - **vehicle_can**  
   Full raw data from the CAN bus.  
@@ -27,27 +27,22 @@ The DUCO App service connects to **Azure IoT Hub** and sends the collected data 
 
 ## 2. Data Processing
 
-### 2.1 Ingestor Server
+### Ingestor Server
 
 The **Ingestor Server** connects to **Azure IoT Hub** and receives the data collected by the DUCO App.
 
 Using parsing logic configured in **MetaAPI**, the raw data is parsed into **human-readable data**.
 
 After parsing:
+
 - One copy of the parsed data is stored in **ClickHouse**
-- Another copy is **published to Kafka**
+- Another copy is published to **Kafka**
+- A real-time copy is published to **Redis Pub/Sub**
+  - Topic format: `live-stream/{tenant}/consumer-{chassisId}/{msgType}`
 
----
-
-### 2.2 Distributor Server
-
-The **Distributor Server** subscribes to the Kafka service and receives the parsed data.
-
-For data of type **realTime**:
-- The data is published to **Redis Pub/Sub**
-- The topic format is:
-
-`live-stream/{tenant}/consumer-{chassisId}/{msgType}`
+::callout{icon="i-lucide-alert-triangle" type="warning"}
+Redis Pub/Sub will be replaced by Redis Streams in the future.
+::
 
 ---
 
@@ -93,14 +88,55 @@ For each message received from Redis:
 
 - 3. Messages are picked by filedList and sent:
 ```ts
-const filedList = clientFields.get(peer)!;
-const payload = JSON.parse(message).payload;
+// recieve message from redis
+const messageHandler = ({
+  channel,
+  message
+}: {
+  channel: string;
+  message: string;
+}) => {
+  if (!channel.startsWith('live-stream/')) return;
 
-const filteredPayload = _.pick(payload, filedList)
-peer.send(JSON.stringify({
-  type: 'LIVE_DATA',
-  payload: filteredPayload
-}));
+  // Channel format example: live-stream/{tenantId}/consumer-{chassisId}/{msgType}
+  const match = /^live-stream\/[^/]+\/consumer-([^/]+)\/([^/]+)$/.exec(channel);
+  if (!match) {
+    logger.warn(
+      `${new Date().toISOString().slice(5, 19)} [ws] unexpected channel format: ${channel}`
+    );
+    return;
+  }
+
+  const chassisId = match[1];
+  const msgType = match[2] ?? '';
+  const key = buildConnectionKey(chassisId, msgType);
+
+  if (key && clientConnections.has(key)) {
+    const connections = clientConnections.get(key)!;
+    connections.forEach((peer) => {
+      try {
+        // filter the payload by the filedList
+        const filedList = clientFields.get(peer)!;
+        const payload = JSON.parse(message).payload;
+
+        const filteredPayload = _.pick(payload, filedList)
+        peer.send(JSON.stringify({
+          type: 'LIVE_DATA',
+          payload: filteredPayload
+        }));
+      } catch (error) {
+        logger.error(
+          `${new Date().toISOString().slice(5, 19)} [ws] error sending to client ${key}::${msgType}: ${error}`
+        );
+        connections.delete(peer);
+        try {
+          peer.close?.();
+        } catch {}
+      }
+    });
+  }
+};
+
 ```
 ### 3.3 Live Data Configuration in DUCO Studio Portal
 
@@ -110,37 +146,29 @@ After the configuration is completed, the group list is displayed as shown below
 
 ![Group list](/images/live_data_group.png)
 
-For details on how to configure groups, please refer to  
-[Config Group](/customer/live-view/livedata).
+For details on how to configure groups, please refer to  [Config Group](/customer/live-view/livedata).
 
-By default, each ECharts Line Group in the Group List displays data from the past 2 minutes.
 
-When the Live Data page is initialized:
-- The frontend calls a DUCO Studio API to request historical data.
-- The DUCO Studio API connects to ClickHouse.
-- ClickHouse is queried to retrieve data from the previous two minutes.
-- The queried data is returned to the frontend and rendered in the corresponding ECharts line charts.
-This ensures that users can immediately see recent historical data before real-time data starts streaming.
+By default, each ECharts line group displays data from the past 2 minutes.
 
+On page initialization, historical data from ClickHouse is loaded and rendered in the charts, providing immediate context before live data streaming starts.
+
+<a id="websocket-init"></a>
 
 ### 3.4 WebSocket Initialization on Page Mount
 
 When the **Live Data** page is mounted:
 
 1. Field List Initialization & Filtering via WebSocket
-- Retrieve the fields list under the Group List for both:
+- Retrieve the **fieldList** under the Group configuration List for both:
   - `vehicle_can`
   - `client_raw_data`
-- After the WebSocket connection is successfully established, send the retrieved fields lists to the WebSocket server.
-- The WebSocket server stores the fields lists separately on the server side.
+- After the WebSocket connection is successfully established, send the retrieved **fieldList** to the WebSocket server.
+- The WebSocket server stores the **fieldList** separately on the server side.
 - When the socket sends a message, it picks only the requested fields and returns only the required fields to the client.
 
-2. The frontend initializes WebSocket connections by calling the following msg Type:
+2. The frontend initializes WebSocket connections by calling the following URLs:
 
-- `vehicle_can`
-- `client_raw_data`
-
-These codes establish connections to the **DUCO Studio WebSocket server** using the logic shown below:
 
 ```ts[vehicle_can]
 const connectionUrl = `/api/resources/${props.orgId}/_common/datasets/${props.chassisId}/live?msgType=vehicle_can`;
@@ -151,7 +179,7 @@ if (!wsUrl) {
 }
 
 client = new WebSocket(wsUrl);
-const fieldList = [
+const fieldList = [ // Example
     'speed',
     'engine_rpm',
     'brake_status'
@@ -164,6 +192,7 @@ client.onopen = () => {
 }
 
 ```
+- **Subscribed Redis topic**: `live-stream/duco/consumer-DUCO_001/vehicle_can`
 
 For metrics data, a separate WebSocket connection is created:
 
@@ -189,11 +218,24 @@ metricClient.onopen = () => {
 }
 
 ```
+- **Subscribed Redis topic**: `live-stream/duco/consumer-DUCO_001/client_raw_data`
+
 After the WebSocket connection is successfully established, the frontend listens
 for messages from the server. Each incoming message is parsed and immediately
 applied to the corresponding **ECharts line series**, allowing the chart to be
-updated dynamically in real time.
+updated dynamically in real time. 
+
+::callout{icon="i-lucide-alert-triangle" type="warning"}
+If no data is received within 10 seconds, the connection is considered disconnected by default, and the UI is displayed as offline. If the connection is lost, the user can click the **Refresh** button to reconnect.
+::
+
+**Demo Video**
+<iframe src="/videos/liveData.mp4" title="Live Data Demo" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen style="aspect-ratio: 16/9; width: 100%;"></iframe>
+
+
 ### 3.5 Real-time Architecture Diagram
+
+
 ::mermaid
 
 flowchart TB
@@ -208,128 +250,131 @@ subgraph Cloud\["Cloud Ingestion"]
   META\[MetaAPI Parsing Logic]
   CH\[(ClickHouse)]
   KAFKA\[(Kafka)]
+  REDIS\[(Redis Pub/Sub)]
 M2 -->|vehicle_can / client_raw_data| IOT
 IOT -->|Raw Data| ING
 ING --> META
 META -->|Parsed Data| CH
 META -->|Parsed Data| KAFKA
+META -->|Parsed Data -> Pub| REDIS
 end
 subgraph Metaapi\["Metaapi Server"]
   METAAPI\[API Server]
 METAAPI -->|Get Parsed Data Logic| META
 end
-subgraph Distribution\["Distribution Layer"]
-  DIST\[Distributor Server]
-  REDIS\[(Redis Pub/Sub)]
-end
-KAFKA --> DIST
-DIST -->|realTime data| REDIS
 subgraph Studio\["DUCO Studio Server"]
-  API\[DUCO Studio API]
+  API\[DUCO Studio API Proxy]
   WS\[WebSocket Service]
 end
-REDIS -->|topic:live-stream/**tenantId**/consumer-**chassisId**/**msgType**| WS
+REDIS -->|Sub live-stream/*| WS
 subgraph Frontend\["DUCO Studio Frontend"]
-  PAGE\["Live Data Page"]
+  PAGE\["Live Data Page
+UI Mounted"]
   ECHARTS\[ECharts Line Charts]
 end
-API -->|Query historical data| CH
 API -->|Initial Echarts data| ECHARTS
-CH -->|Get Historical data past 2 min| API
+CH -->|Get 2 min data| API
 WS -->|Filtered Live Data| ECHARTS
 ECHARTS -->|Render Charts| PAGE
 PAGE -->|Create WebSocket and Send INIT_FIELD_LIST| WS
-::
 
+::
+<!-- 
+  REDIS_S\[(Redis Stream)]
+  META -.->|Parsed Data -> stream| REDIS_S
+  REDIS_S -.->| Sub stream| WS
+  REDIS_S -.->|Get 2 mins data| API
+linkStyle 6 stroke:#FFA500,stroke-width:2px
+linkStyle 7 stroke:#00aa88,stroke-width:2px
+linkStyle 9 stroke:#FFA500,stroke-width:2px
+linkStyle 10 stroke:#00aa88,stroke-width:2px
+linkStyle 12 stroke:#FFA500,stroke-width:2px
+linkStyle 13 stroke:#00aa88,stroke-width:2px -->
 ---
 
-## 4. Testing Real-Time Data Control via Command
-After the Live Data page is loaded, the frontend queries MetaAPI to retrieve the current real-time status of the selected machine.
+## 4. Real-Time Data Control via 
 
-The status is displayed in the Group Management Panel, with one status indicator shown per group:
-- 🟢 Real-Time is running
-  > Indicates that real-time data transmission is currently enabled.
-- 🔴 Real-Time is stopped
-  > Indicates that real-time data transmission is currently disabled.
+When the UI page is mounted, the page invokes the **MetaAPI** service to start the real-time data stream for the target device.  
+The request is first routed through the **DUCO Studio Server API proxy**, which then forwards the call to the MetaAPI service.
 
-Manual Start / Stop Control
+At the same time, the **MetaAPI** service invokes a **Direct Method via Azure IoT Hub** to send a real-time command to the **DUCO App** running on the device.  
+After receiving the command, the DUCO App starts the real-time data stream and returns the execution result to the MetaAPI service.  
+The MetaAPI service then forwards the result back to the UI page.
 
-When a user manually clicks Start or Stop button in the Group Management Panel, the Live Data page calls a MetaAPI interface to control the real-time data transmission state of the machine.
-`POST /api/iothubs/${iothubName}/devices/${deviceId}/methods`
+Once the real-time data stream is successfully started, the system proceeds with the 
+[**3.4 WebSocket Initialization on Page Mount**](#websocket-init)  
+workflow to continuously display real-time data on the UI.
 
-Body:
-```json[start]
-{
-  "methodName": "startMs",
-  "payload": {
-    "reason": "user_action",
-    "commandId": "userId"
-  }
-}
-```
-```json[stop]
-{
-  "methodName": "endMs",
-  "payload": {
-    "reason": "user_action",
-    "commandId": "userId"
- }
-}
-```
-### 4.1 Real-Time Command Delivery and Execution Flow
-After a request is sent to MetaAPI, the MetaAPI service connects to Azure IoT Hub and delivers real-time control commands to the target machine.
-Command Delivery
-- MetaAPI sends Start or Stop real-time commands to the machine through Azure IoT Hub.
-- The commands are delivered to the device associated with the specified machine.
-Command Execution on Machine
-- When the machine is running or powered on, it receives the command from IoT Hub.
-- Upon receiving the command:
-  - A Start command enables the DUCO App to begin sending real-time data.
-  - A Stop command disables the DUCO App from sending real-time data.
-Impact on Live Data Page
-- When real-time transmission is enabled:
-  - The Live Data page receives real-time data via WebSocket.
-  - Data is dynamically rendered and updated in ECharts line charts.
-- When real-time transmission is disabled:
- - The machine stops sending real-time data.
- - The Live Data page stops receiving and displaying real-time updates.
+---
+### 4.1 Heartbeat Mechanism
+- The UI page sends a heartbeat request to the MetaAPI service **every 1 minute**.
+- If multiple users access the same device simultaneously, the **DUCO Studio Server** aggregates these requests and stores them in **Redis** with a **1-minute TTL**.
+- A **cron job** runs every minute:
+  - If there are active requests stored in Redis, the server invokes the MetaAPI service to keep the real-time stream active.
+  - If there are no active requests in Redis, no invocation is sent.
 
- ### 4.2 Test Command Architecture Diagram (Logical View)
+On the device side, the **DUCO App** also performs heartbeat monitoring:
+- If no command is received for more than **3 minutes**, the DUCO App automatically stops the real-time data stream.
+
+
+### 4.2 Command Architecture Diagram (Logical View)
 
 ::mermaid
+
 flowchart TB
-subgraph Machine\["Machine Side"]
-  M2\[DUCO App]
+subgraph Machine\["Device / Machine Side"]
+  APP\[DUCO App]
 end
-subgraph Cloud\["Cloud Ingestion"]
-  IOT\[Azure IoT Hub]
+subgraph Cloud\["Azure Cloud"]
+  IOT\[Azure IoT Hub
+  Direct Method]
 end
-M2 <-->|MQTT  Receive Command&Response Result | IOT
-subgraph Metaapi\["Metaapi Server"]
-  METAAPI\[API Server]
+subgraph MetaAPI\["MetaAPI Service"]
+  META\[MetaAPI Server]
 end
-IOT <-->|MQTT Send Command & Response Result / Ack| METAAPI
-subgraph Studio\["DUCO Studio Server"]
-  API\[DUCO Studio API]
-end
-API -->|Request Metaapi| METAAPI
-METAAPI -->|Get Metaapi Data| API
 subgraph Frontend\["DUCO Studio Frontend"]
-  subgraph PAGE\[Live Data Page]
-    RTStatus\[Real-Time Status]
-    RTStart\[Real-Time Start]
-    RTStop\[Real-Time Stop]
-  end
+  PAGE\[Live Data Page
+  UI Mounted]
 end
-API -->|Response Metaapi data| PAGE
-PAGE -->|Request Proxy Metaapi| API
+subgraph Studio\["DUCO Studio Server"]
+  API\[API Proxy]
+  REDIS\[(Redis
+  1 min TTL)]
+  CRON\[Cron Job
+  Every 1 min]
+end
+API -->|Forward First Request| META
+META -->|Invoke Direct Method| IOT
+IOT -->|Command| APP
+APP -->|Execution Result| IOT
+IOT -->|Result / Ack| META
+PAGE -->|Heartbeat 1 min| API
+API -->|Store Access| REDIS
+REDIS -->|Check Active Requests| CRON
+CRON -->|Invoke MetaAPI if Active| META
+APP -->|No Command > 3 min 
+Stop Stream| APP
 ::
+
 
 ---
 
-## 5. ALL Architecture Diagram (Logical View)
+## 5. Complete Live Data Architecture Diagram (Logical View)
 ::mermaid
 
+%%{init: {
+  "themeVariables": {
+    "fontSize": "32px",          
+    "nodeTextColor": "#000000",  
+    "nodePadding": "20px",
+    "lineHeight": "22px"              
+  },
+  "flowchart": {
+    "rankSpacing": 150,
+    "nodeSpacing": 120,
+    "htmlLabels": true           
+  }
+}}%%
 flowchart TB
 subgraph Machine\["Machine Side"]
   M1\[Machine Sensors]
@@ -342,44 +387,53 @@ subgraph Cloud\["Cloud Ingestion"]
   META\[MetaAPI Parsing Logic]
   CH\[(ClickHouse)]
   KAFKA\[(Kafka)]
+  REDIS\[(Redis Pub/Sub)]
+M2 -->|No Command > 3 min 
+Stop Stream| M2
 M2 -->|vehicle_can / client_raw_data| IOT
 IOT -->|Raw Data| ING
 ING --> META
 META -->|Parsed Data| CH
 META -->|Parsed Data| KAFKA
-IOT <-->|Mqtt Receive Command & Response Result| M2
+META -->|Parsed Data -> Pub| REDIS
 end
 subgraph Metaapi\["Metaapi Server"]
   METAAPI\[API Server]
 METAAPI -->|Get Parsed Data Logic| META
-METAAPI <-->|MQTT Send Command& Response Result/ACK| IOT
 end
-subgraph Distribution\["Distribution Layer"]
-  DIST\[Distributor Server]
-  REDIS\[(Redis Pub/Sub)]
-end
-KAFKA --> DIST
-DIST -->|realTime data| REDIS
-subgraph Studio\["DUCO Studio Server"]
-  API\[DUCO Studio API]
-  WS\[WebSocket Service]
-API -->|Request Metaapi| METAAPI
-end
-REDIS -->|topic:live-stream/**tenantId**/consumer-**chassisId**/**msgType**| WS
 subgraph Frontend\["DUCO Studio Frontend"]
-  PAGE\["Live Data Page"]
+  PAGE\["Live Data Page
+UI Mounted"]
   ECHARTS\[ECharts Line Charts]
 end
-PAGE -->|Request last 2 minutes data| API
-PAGE -->|Request Proxy MetaAPI| API
-PAGE -->|Create WebSocket Connection & Send INIT_FIELD_LIST| WS
-API -->|Query historical data| CH
+subgraph Studio\["DUCO Studio Server"]
+  API\[API Proxy]
+  WS\[WebSocket Service]
+  REDIS_Job\[(Redis
+  1 min TTL)]
+  CRON\[Cron Job
+  Every 1 min]
+end
+API -->|Store Access| REDIS_Job
+REDIS_Job -->|Check Active Requests| CRON
+CRON -->|Invoke MetaAPI if Active| METAAPI
+REDIS -->|Sub live-stream/*| WS
+PAGE -->|Heartbeat 1 min| API
+API -->|Forward First Request| METAAPI
+METAAPI -->|Invoke Direct Method| IOT
+IOT -->|Command| M2
+M2 -->|Execution Result| IOT
+IOT -->|Result / Ack| METAAPI
 API -->|Initial Echarts data| ECHARTS
-API -->|Get Metaapi data| PAGE
-CH -->|Get Historical data past 2 min| API
+CH -->|Get 2 min data| API
 WS -->|Filtered Live Data| ECHARTS
 ECHARTS -->|Render Charts| PAGE
+PAGE -->|Create WebSocket and Send INIT_FIELD_LIST| WS
+
 ::
+
+
+
 
 
 

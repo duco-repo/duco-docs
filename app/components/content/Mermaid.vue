@@ -26,3 +26,9 @@ onMounted(async () => {
   </div>
 
 </template>
+<style>
+.mermaid svg {
+  transform: scale(1);   /* 调整倍率 */
+  transform-origin: top left;
+}
+</style>

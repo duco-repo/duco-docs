@@ -1,8 +1,5 @@
 <template>
-  <NuxtImg src="/images/icon-512.png" 
-  
-  
-  />
+  <NuxtImg src="/images/icon-512.png" />
   <!-- <svg
     width="1020"
     height="200"

@@ -10,7 +10,7 @@ export default defineAppConfig({
         left: 'text-sm text-muted'
       }
     },
-     prose: {
+    prose: {
       codeIcon: {
         terminal: 'i-ph-terminal-window-duotone',
         config: 'i-lucide-settings',
@@ -38,7 +38,7 @@ export default defineAppConfig({
     //   'target': '_blank',
     //   'aria-label': 'GitHub'
     // }
-  ]
+    ]
   },
   footer: {
     credits: `DUCO Docs • © ${new Date().getFullYear()}`,
@@ -60,7 +60,7 @@ export default defineAppConfig({
     //   'target': '_blank',
     //   'aria-label': 'Nuxt UI on GitHub'
     // }
-  ]
+    ]
   },
   toc: {
     title: 'Table of Contents',
@@ -80,7 +80,7 @@ export default defineAppConfig({
       //   to: 'https://ui.nuxt.com/docs/getting-started/installation/nuxt',
       //   target: '_blank'
       // }
-    ]
+      ]
     }
   }
 })

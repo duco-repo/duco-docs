@@ -470,3 +470,210 @@ sequenceDiagram
 Alice->>Bob: Hello Bob
 Bob-->>Alice: Hi Alice
 ::
+
+
+# E2E Second-level Live Data Streaming Pipeline
+
+## Processing Overview
+
+This document describes the **end-to-end (E2E) second-level live data processing pipeline** for vehicle **CAN** and **Metrics** signals, covering the full path from data ingestion on the machine to real-time visualization in the frontend via **WebSocket**.
+
+The system is designed to support:
+
+- High-frequency signal collection (1 Hz)
+- Tenant isolation
+- Per-user and per-field filtering
+- Real-time streaming to multiple concurrent users
+
+---
+
+## High-level Data Flow
+
+The overall live data flow is as follows:
+
+1. The machine boots up
+2. Raw CAN signals are collected every second
+3. Data is validated, parsed, and published to Kafka
+4. Live data is distributed via Redis Pub/Sub
+5. WebSocket service authenticates frontend users
+6. Real-time data is filtered and pushed to clients
+7. Grouped ECharts line charts update dynamically
+
+---
+
+## Detailed Flow Description
+
+### 1. Data Collection (Machine Side)
+
+After the machine starts, the **Duco App Service** running on the vehicle performs the following actions:
+
+- Collects raw CAN signals from the CAN bus
+- Sampling frequency: **once per second (1 Hz)**
+- Sends raw data to the **Ingestion Service**
+
+This stage ensures reliable and continuous signal acquisition directly from the vehicle.
+
+---
+
+### 2. Ingestion & Validation
+
+The **Ingestion Service** is responsible for processing incoming raw data:
+
+- Validates incoming request parameters
+- Parses raw CAN frames into structured signal data
+- Produces processed data into Kafka topics
+
+**Purpose of this stage:**
+
+- Decouple upstream data collection from downstream consumers
+- Enable horizontal scalability
+- Improve system fault tolerance
+
+---
+
+### 3. Data Distribution
+
+The **Distributor Service** handles live data fan-out:
+
+- Consumes second-level signal data from Kafka
+- Publishes live data using **Redis Pub/Sub**
+
+#### Redis Topic Naming Convention
+
+```bash
+live-stream/{tenant}/consumer-{chassisId}/{msgType}
+
+```
+Where:
+
+tenant → Tenant isolation
+
+chassisId → Unique machine identifier
+
+msgType → Signal category or message type
+
+## 4. WebSocket Service (Duco Studio)
+
+Duco Studio exposes a **WebSocket server** responsible for:
+
+- Managing frontend connections
+- Performing user authentication and authorization
+- Handling connection and subscription lifecycles
+
+### Connection Lifecycle
+
+1. The frontend establishes a WebSocket connection
+2. Authentication is performed
+3. The client sends an initial subscription message containing:
+   - User context
+   - Machine identifier
+   - Required signal fields
+
+#### Example Subscription Payload
+
+```json
+{
+  "fields": ["speed", "rpm"]
+}
+```
+
+## 5. Subscription Management (WebSocket Server)
+
+For each active WebSocket connection:
+
+- Required signal fields are stored in memory
+- The server subscribes to the corresponding **Redis Pub/Sub topics**
+- Multiple users can subscribe to the **same machine** simultaneously
+
+This design enables:
+
+- Efficient fan-out
+- Per-user data isolation
+- Flexible subscription management
+
+---
+
+## 6. Redis to WebSocket Forwarding
+
+When Redis receives new live data messages, the WebSocket service performs the following steps:
+
+1. Identifies all active WebSocket connections
+2. Applies **per-user field filtering** using `pick(fields)`
+3. Forwards only the required signal fields to each client
+
+### Benefits
+
+- Reduced payload size
+- Per-user and per-field data isolation
+- Efficient real-time broadcasting
+
+---
+
+## 7. Frontend Rendering
+
+On the frontend side:
+
+- Second-level live data is received via WebSocket
+- Signals are logically grouped
+- **ECharts line charts** are dynamically updated
+- Near real-time visualization is achieved
+
+---
+
+## Data Processing Characteristics
+
+### Latency
+
+- Approximately **1 second**
+
+### Transport Layers
+
+- **Kafka**: Durable and scalable data streaming
+- **Redis Pub/Sub**: Low-latency real-time fan-out
+- **WebSocket**: Push-based frontend delivery
+
+### Filtering Strategy
+
+- Per-user
+- Per-machine
+- Per-field
+
+### Scalability
+
+- Kafka supports horizontal scaling
+- Redis Pub/Sub enables efficient real-time distribution
+- WebSocket nodes remain stateless (except in-memory subscriptions)
+
+---
+
+## Architecture Diagram (Logical View)
+
+### ASCII Diagram (Markdown-friendly)
+
+```text
++-------------+        +----------------+        +--------+
+|   Machine   |        |  Ingestion     |        | Kafka  |
+| Duco App    | -----> |  Service       | -----> |        |
+| (CAN Data)  |        | (Validate &    |        |        |
++-------------+        |  Parse)        |        +--------+
+                       +----------------+
+                                |
+                                v
+                      +------------------+
+                      |  Distributor     |
+                      |  Service         |
+                      +------------------+
+                                |
+                                v
+                       Redis Pub/Sub (Live)
+                                |
+                                v
+                      +------------------+
+                      | WebSocket Server |
+                      | (Duco Studio)    |
+                      +------------------+
+                                |
+                                v
+                      Frontend (ECharts)
+
+```

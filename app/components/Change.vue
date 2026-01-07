@@ -12,9 +12,10 @@
     </div>
   </div>
 </template>
+
 <script setup lang="ts">
 defineProps<{
-  hash: string;
-  type: string;
-}>();
+  hash: string,
+  type: string
+}>()
 </script>

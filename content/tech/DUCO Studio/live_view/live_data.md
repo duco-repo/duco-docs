@@ -292,10 +292,23 @@ linkStyle 12 stroke:#FFA500,stroke-width:2px
 linkStyle 13 stroke:#00aa88,stroke-width:2px -->
 ---
 
-## 4. Real-Time Data Control via 
+## 4. Real-Time Data Control via Command
 
 When the UI page is mounted, the page invokes the **MetaAPI** service to start the real-time data stream for the target device.  
 The request is first routed through the **DUCO Studio Server API proxy**, which then forwards the call to the MetaAPI service.
+
+**MetaAPI Request:**
+
+```ts[POST /api/iothubs/ducohub/devices/${chassisId}/methods]
+{
+  "methodName": "setRealTimeUpload",
+  "payload": {
+    "action":"start",
+    "reason": "user_action",
+    "commandId": "123e4567-e89b-12d3-a456-426614174000"
+  }
+}
+```
 
 At the same time, the **MetaAPI** service invokes a **Direct Method via Azure IoT Hub** to send a real-time command to the **DUCO App** running on the device.  
 After receiving the command, the DUCO App starts the real-time data stream and returns the execution result to the MetaAPI service.  
